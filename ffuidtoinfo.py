@@ -1,4 +1,4 @@
-import sys
+import os
 import requests
 from flask import Flask, request, jsonify
 
@@ -11,81 +11,64 @@ SUPPORTED_REGIONS = {
     "MY": "Malaysia",
     "ID": "Indonesia",
     "PK": "Pakistan",
-    "MA": "Middle East (MENA)",
+    "MA": "Middle East / MENA",
     "BR": "Brazil",
     "TH": "Thailand",
-    "VN": "Vietnam"
+    "VN": "Vietnam",
 }
 
+# IMPORTANT:
+# এখানে শুধুমাত্র তোমার অনুমোদিত/বৈধ player lookup API-এর URL বসাবে।
+# Render Environment Variable থেকে নেওয়া হবে।
+UPSTREAM_API_URL = os.environ.get("PLAYER_LOOKUP_API_URL", "").strip()
+UPSTREAM_API_KEY = os.environ.get("PLAYER_LOOKUP_API_KEY", "").strip()
 
-def check_player_info(target_id, requested_region=None):
+
+def check_player_info(uid, requested_region=None):
+    if not uid.isdigit():
+        return {
+            "error": "UID must contain only numbers"
+        }, 400
 
     if requested_region:
-        regions_to_test = [requested_region.upper()]
+        regions = [requested_region.upper()]
     else:
-        regions_to_test = [
-            "BD",
-            "IN",
-            "SG",
-            "MA",
-            "PK",
-            "BR"
-        ]
+        regions = list(SUPPORTED_REGIONS.keys())
 
-    diagnostics = []
+    if not UPSTREAM_API_URL:
+        return {
+            "error": "Player lookup API is not configured on the server."
+        }, 503
 
-    for r_code in regions_to_test:
+    for region in regions:
 
-        if r_code not in SUPPORTED_REGIONS:
-            diagnostics.append({
-                "region": r_code,
-                "status": "UNSUPPORTED_REGION"
-            })
+        if region not in SUPPORTED_REGIONS:
             continue
 
         print(
-            f"Checking UID={target_id} REGION={r_code}",
+            f"Checking UID={uid} REGION={region}",
             flush=True
         )
 
-        cookies = {
-            "source": "mb",
-            "region": r_code,
-            "language": "en" if r_code != "MA" else "ar"
+        params = {
+            "uid": uid,
+            "region": region
         }
 
         headers = {
-            "Accept-Language": "en-US,en;q=0.9",
             "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 11) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/107.0.0.0 Mobile Safari/537.36"
-            )
+            "User-Agent": "RED-TOUR-UID-Checker/1.0"
         }
 
-        json_data = {
-            "app_id": 100067,
-            "login_id": target_id,
-            "app_server_id": 0
-        }
+        if UPSTREAM_API_KEY:
+            headers["Authorization"] = f"Bearer {UPSTREAM_API_KEY}"
 
         try:
-
-            response = requests.post(
-                "https://shop2game.com/api/auth/player_id_login",
-                cookies=cookies,
+            response = requests.get(
+                UPSTREAM_API_URL,
+                params=params,
                 headers=headers,
-                json=json_data,
-                timeout=8
-            )
-
-            print(
-                f"UPSTREAM STATUS {r_code}: "
-                f"{response.status_code}",
-                flush=True
+                timeout=10
             )
 
             content_type = response.headers.get(
@@ -94,150 +77,122 @@ def check_player_info(target_id, requested_region=None):
             )
 
             print(
-                f"UPSTREAM CONTENT-TYPE {r_code}: "
-                f"{content_type}",
+                f"UPSTREAM STATUS {region}: {response.status_code}",
                 flush=True
             )
 
-            # JSON response পরীক্ষা
+            print(
+                f"UPSTREAM CONTENT-TYPE {region}: {content_type}",
+                flush=True
+            )
+
+            if response.status_code == 403:
+                print(
+                    f"UPSTREAM FORBIDDEN {region}",
+                    flush=True
+                )
+                continue
+
+            if response.status_code == 404:
+                continue
+
+            response.raise_for_status()
+
             try:
                 data = response.json()
             except ValueError:
-
-                diagnostics.append({
-                    "region": r_code,
-                    "status_code": response.status_code,
-                    "result": "NON_JSON_RESPONSE"
-                })
-
                 print(
-                    f"UPSTREAM {r_code}: NON JSON RESPONSE",
+                    f"INVALID JSON RESPONSE {region}",
                     flush=True
                 )
-
                 continue
 
-            # nickname পাওয়া গেলে success
-            nickname = data.get("nickname")
+            nickname = (
+                data.get("nickname")
+                or data.get("name")
+                or data.get("player_name")
+            )
 
-            if response.status_code == 200 and nickname:
-
+            if nickname:
                 print(
-                    f"PLAYER FOUND: {nickname} "
-                    f"REGION={r_code}",
+                    f"PLAYER FOUND {region}: {nickname}",
                     flush=True
                 )
 
                 return {
                     "nickname": nickname,
-                    "region_code": r_code,
-                    "region_name": SUPPORTED_REGIONS[r_code]
-                }
-
-            # Diagnostic information
-            diagnostics.append({
-                "region": r_code,
-                "status_code": response.status_code,
-                "has_nickname": bool(nickname),
-                "response_keys": list(data.keys())
-            })
-
-            print(
-                f"NO PLAYER RESULT {r_code}: "
-                f"status={response.status_code}, "
-                f"keys={list(data.keys())}",
-                flush=True
-            )
+                    "region_code": region,
+                    "region_name": SUPPORTED_REGIONS[region]
+                }, 200
 
         except requests.exceptions.Timeout:
-
-            diagnostics.append({
-                "region": r_code,
-                "status": "TIMEOUT"
-            })
-
             print(
-                f"TIMEOUT: {r_code}",
+                f"UPSTREAM TIMEOUT {region}",
                 flush=True
             )
 
-        except requests.exceptions.RequestException as error:
-
-            diagnostics.append({
-                "region": r_code,
-                "status": "REQUEST_ERROR",
-                "message": str(error)
-            })
-
+        except requests.exceptions.RequestException as exc:
             print(
-                f"REQUEST ERROR {r_code}: {error}",
+                f"UPSTREAM ERROR {region}: {exc}",
                 flush=True
             )
 
     return {
-        "error": "PLAYER LOOKUP FAILED",
-        "diagnostics": diagnostics
-    }
+        "error": "Player information could not be retrieved from the configured lookup service."
+    }, 502
 
 
 @app.route("/", methods=["GET"])
-def home_region_info():
-
-    uid = request.args.get("uid")
-    region = request.args.get("region")
+def home():
+    uid = request.args.get("uid", "").strip()
+    region = request.args.get("region", "").strip()
 
     if not uid:
         return jsonify({
             "error": "UID parameter is required"
         }), 400
 
-    result = check_player_info(
+    result, status = check_player_info(
         uid,
-        region
+        region or None
     )
 
-    if "error" in result:
-        return jsonify(result), 502
-
-    return jsonify(result), 200
+    return jsonify(result), status
 
 
 @app.route("/xp-opu", methods=["GET"])
-def get_region_info():
-
-    uid = request.args.get("uid")
-    region = request.args.get("region")
+def xp_opu():
+    uid = request.args.get("uid", "").strip()
+    region = request.args.get("region", "").strip()
 
     if not uid:
         return jsonify({
             "error": "UID parameter is required"
         }), 400
 
-    result = check_player_info(
+    result, status = check_player_info(
         uid,
-        region
+        region or None
     )
 
-    if "error" in result:
-        return jsonify(result), 502
-
-    return jsonify(result), 200
+    return jsonify(result), status
 
 
 @app.route("/health", methods=["GET"])
 def health():
-
     return jsonify({
         "status": "ok",
-        "service": "Free Fire UID Checker API"
+        "service": "Free Fire UID Checker"
     })
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
 
-    port = int(
-        sys.argv[1]
-    ) if len(sys.argv) > 1 else 5000
+    print(
+        f"Starting server on 0.0.0.0:{port}",
+        flush=True
+    )
 
     app.run(
         host="0.0.0.0",
